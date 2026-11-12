@@ -70,6 +70,43 @@ Descobertas:
   antes confiável. As falhas EIO atingem intermitentemente todas as
   configurações.
 
+## Por que uma execução que funcionou antes falha agora (12 nov 2026, ~17:52)
+
+Mesmo comando, mesma entrada, mesma box, 5 execuções seguidas:
+
+| Execução | Resultado |
+|---|---|
+| 1 | 150/150, 28 fps, 3225 KiB |
+| 2 | 150/150, 28 fps, 3225 KiB |
+| 3 | 150/150, 28 fps, 3225 KiB |
+| 4 | **FALHOU no frame 17** (EIO, 0,4 fps) |
+| 5 | 150/150, 28 fps, 3225 KiB |
+
+Descartados por medição: temperatura (54 °C, CPU a 1,2 GHz cheios, sem
+throttling), pressão de memória (512 MB disponíveis, sem OOM),
+fragmentação de CMA (198 MB livres, 19 blocos livres de 4 MB),
+configurações (a execução que falhou usava os padrões).
+
+**Conclusão: uma corrida de inicialização por execução.** Cada execução
+do ffmpeg ganha um reset completo do HCodec + recarga do firmware
+(`avc_poweron` + `reload_mc`), então um travamento nunca sobrevive para
+a próxima execução — mas dentro de uma execução, uma vez que um frame
+estoura o tempo, o HCodec nunca se recupera. Todas as falhas observadas
+são nos primeiros ~20 frames (frames 12–23); nenhuma execução jamais
+falhou depois do frame 23. As execuções bem-sucedidas são
+bit-idênticas (mesmo tamanho, mesmo bitrate), então o codificador é
+determinístico quando sobrevive à inicialização. O gatilho provável é
+uma conclusão de mailbox/IRQ perdida durante a rajada inicial de
+frames, antes do estado driver/firmware estar assentado.
+
+Consequência prática para um serviço de live: ~20–25% das partidas do
+codificador travam no primeiro segundo. Mitigue com um watchdog que
+reinicia o ffmpeg quando nenhum frame é produzido por alguns segundos
+(cada reinício é uma nova moeda; 2–3 tentativas dão >99% de sucesso).
+Um fix no nível do driver (ordem da configuração da IRQ, ou
+reset-on-EIO em `avc_k_frame`) é depuração real de driver e não foi
+feito.
+
 Software (libx264, CRF 23 padrão) para comparação:
 
 | Preset | 1080p fps | 1080p tamanho | 720p fps |

@@ -64,6 +64,40 @@ Findings:
   the encoder is flaky even on the previously reliable software-decoded
   feed. The EIO failures strike intermittently in every configuration.
 
+## Why a run that worked before fails now (12 Nov 2026, ~17:52)
+
+Same command, same input, same box, 5 back-to-back runs:
+
+| Run | Result |
+|---|---|
+| 1 | 150/150, 28 fps, 3225 KiB |
+| 2 | 150/150, 28 fps, 3225 KiB |
+| 3 | 150/150, 28 fps, 3225 KiB |
+| 4 | **FAILED at frame 17** (EIO, 0.4 fps) |
+| 5 | 150/150, 28 fps, 3225 KiB |
+
+Ruled out by measurement: temperature (54 °C, CPU at full 1.2 GHz, no
+throttling), memory pressure (512 MB available, no OOM), CMA
+fragmentation (198 MB free, 19 free 4 MB blocks), settings (the failing
+run used the defaults).
+
+**Conclusion: a per-run startup race.** Each ffmpeg run gets a full
+HCodec reset + firmware reload (`avc_poweron` + `reload_mc`), so a
+wedge never survives into the next run — but within a run, once a frame
+times out, the HCodec never recovers. Every observed failure is in the
+first ~20 frames (frames 12–23); no run has ever failed after frame 23.
+The successful runs are bit-identical (same size, same bitrate), so the
+encoder is deterministic when it survives startup. The likely trigger
+is a lost mailbox/IRQ completion during the initial frame burst, before
+the driver/firmware state is settled.
+
+Practical consequence for a live service: ~20–25% of encoder starts
+wedge in the first second. Mitigate with a watchdog that restarts
+ffmpeg when no frame is produced for a few seconds (each restart is a
+fresh coin flip; 2–3 retries give >99% success). A driver-level fix
+(IRQ setup ordering, or reset-on-EIO in `avc_k_frame`) is real driver
+debugging and is not done.
+
 Software (libx264, CRF 23 default) for comparison:
 
 | Preset | 1080p fps | 1080p size | 720p fps |
