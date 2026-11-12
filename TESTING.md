@@ -31,6 +31,50 @@ validated with `ffprobe` (codec, resolution, frame count).
   for `/dev/amvenc_avc` (video group, 0660). Verified across a reboot:
   the module loads by itself and both devices appear.
 
+## Driver controls and presets (12 Nov 2026, 1080p testsrc2, 150 frames)
+
+V4L2 encode, software-decoded feed. PSNR is measured against the input
+file (itself libx264-ultrafast testsrc2), so the numbers compare the
+variants against each other, not against pristine video.
+
+| Setting (ffmpeg) | fps | Size | Actual bitrate | PSNR avg |
+|---|---|---|---|---|
+| defaults (4 Mbps, GOP 60) | FAILED (78 fr, 2 fps) | 1.3 MB partial | — | — |
+| `-b:v 8M` | 4.4 (EIO timeouts) | 5.5 MB | 8.9 Mbps | 34.81 |
+| `-b:v 2M` | 29 | 3.3 MB | 5.25 Mbps (!) | 32.74 |
+| `-g 30` | 31 | 2.7 MB | 4.39 Mbps | 32.93 |
+| `-g 120` | 30 | 2.1 MB | 3.44 Mbps | 33.48 |
+| `-qmin 18 -qmax 30` | FAILED (17 fr) | 48 B | — | — |
+
+Findings:
+
+- **GOP 120 is the best setting**: smallest file, lowest bitrate, best
+  PSNR of the ~4 Mbps group, full 30 fps. Fewer IDRs = more bits for
+  P-frames.
+- **8 Mbps gives the best quality (PSNR 34.81)** but ran at 4.4 fps
+  (EIO timeouts on detailed content) and 8.9 Mbps is heavy for
+  streaming.
+- **The 2 Mbps target is NOT respected**: actual 5.25 Mbps. The
+  driver's rate control cannot go below ~5 Mbps for this detailed
+  content at QP 26/28 (QP floor). You cannot just dial the bitrate down
+  for a limited upload.
+- **Do not touch qmin/qmax**: `-qmin 18 -qmax 30` wedged the encoder
+  from frame 0 (probably frames exceeding the 1 MB bitstream buffer).
+- **The defaults run FAILED this time** (78 frames, EIO timeouts) —
+  the encoder is flaky even on the previously reliable software-decoded
+  feed. The EIO failures strike intermittently in every configuration.
+
+Software (libx264, CRF 23 default) for comparison:
+
+| Preset | 1080p fps | 1080p size | 720p fps |
+|---|---|---|---|
+| ultrafast | 9.5 | — | 34 (transcode) |
+| superfast | 13 | 6.3 MB (10.2 Mbps) | 28 |
+| veryfast | 10 | 3.1 MB (5.1 Mbps) | — |
+
+No software preset reaches 1080p30 on this box. At 720p, superfast
+reaches 28 fps.
+
 ## What does not work
 
 ### HW decode + HW encode in one ffmpeg process: hangs or wedges
