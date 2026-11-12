@@ -24,6 +24,9 @@ silicon; mainline has no driver for it. This port makes it work.
   is a closed Amlogic blob; only the driver (GPL) is in this repo.
 - `scripts/build.sh`, `scripts/install.sh` — build the module and install
   it to load at boot.
+- `scripts/live-pipe.sh`, `scripts/live-watchdog.sh` — the HLS live
+  pipeline (HW decode → overlay → HW encode) and its restart watchdog;
+  see TESTING.md.
 
 GXL has an H.264 encoder only — there is no HEVC encoder on this chip
 (the WAVE420L is G12A/SM1 hardware), so there is no `venc-hevc` here.

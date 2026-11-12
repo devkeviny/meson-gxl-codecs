@@ -92,6 +92,7 @@ struct venc_ctx {
 	u32 frame;			/* since the last IDR */
 	int qp2;			/* rate control QP, in 1/2 steps */
 	bool force_idr;
+	u32 err_count;			/* consecutive avc_k_frame errors */
 };
 
 static struct venc_dev *venc;
@@ -199,6 +200,11 @@ static void venc_work(struct work_struct *work)
 		ret = avc_k_headers(ctx->wq, ctx->qp_i->val, &bits, &len);
 		if (ret || len > HDR_MAX) {
 			dev_err(ctx->vdev->dev, "SPS/PPS failed: %d\n", ret);
+			/* drop the broken instance so the next job retries
+			 * the open from scratch instead of encoding headerless
+			 */
+			avc_k_close(ctx->wq);
+			ctx->wq = NULL;
 			goto done;
 		}
 		memcpy(ctx->hdr, bits, len);
@@ -223,12 +229,40 @@ static void venc_work(struct work_struct *work)
 	uv = ctx->fmt->planes == 2 ?
 	     vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1) :
 	     y + ctx->bpl * ctx->height;
+	/* GXL debug (12 Nov 2026): the first-IDR wedge is per-run, and the
+	 * input DMA addresses are the prime suspect (the encoder's own
+	 * 20 MB block is always the same phys address, but ffmpeg's V4L2
+	 * buffers move between processes). Log them at dbg level.
+	 */
+	dev_dbg(ctx->vdev->dev, "frame %u: y 0x%x uv 0x%x idr %d\n",
+		ctx->out_seq, y, uv, idr);
 	ret = avc_k_frame(ctx->wq, idr, ctx->fmt->hw_fmt, y, uv, qp,
 			  &bits, &len);
 	if (ret) {
 		dev_err(ctx->vdev->dev, "frame %u: %d\n", ctx->out_seq, ret);
+		/* The core driver's light reset (poweroff + firmware
+		 * reload) does NOT unwedge a stuck HCodec: 50 resets in
+		 * a row never recovered a failed instance (12 Nov 2026),
+		 * and the wedge is per-instance (a fresh instance works
+		 * ~60-80% of the time). So: force an IDR next (the
+		 * reference state is gone after the reset) and, after
+		 * two consecutive failures, drop the whole instance so
+		 * the next job re-opens it from scratch. The stream
+		 * loses a few frames instead of dying: exactly what a
+		 * live encoder must do.
+		 */
+		WRITE_ONCE(ctx->force_idr, true);
+		if (++ctx->err_count >= 2) {
+			dev_err(ctx->vdev->dev,
+				"recreating encoder instance after %u consecutive errors\n",
+				ctx->err_count);
+			avc_k_close(ctx->wq);
+			ctx->wq = NULL;
+			ctx->err_count = 0;
+		}
 		goto done;
 	}
+	ctx->err_count = 0;
 
 	size = (idr ? ctx->hdr_len : 0) + len;
 	if (size > vb2_plane_size(&dst->vb2_buf, 0)) {

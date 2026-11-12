@@ -27,6 +27,9 @@ silício; o mainline não tem driver para ele. Este port faz ele funcionar.
   (GPL) está neste repositório.
 - `scripts/build.sh`, `scripts/install.sh` — compilam o módulo e o
   instalam para carregar no boot.
+- `scripts/live-pipe.sh`, `scripts/live-watchdog.sh` — o pipeline da
+  live HLS (decodificação HW → overlay → codificação HW) e seu
+  watchdog de reinício; ver TESTING.pt-BR.md.
 
 O GXL só tem codificador H.264 — não existe codificador HEVC neste chip
 (o WAVE420L é hardware G12A/SM1), por isso não há `venc-hevc` aqui.

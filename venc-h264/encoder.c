@@ -3896,13 +3896,19 @@ s32 avc_k_frame(struct encode_wq_s *wq, bool idr, u32 fmt, u32 y, u32 uv,
 	a[5] = ALIGN(w, 32) * ALIGN(h, 16) * 3 / 2;
 	a[6] = qp;
 	a[7] = AMVENC_FLUSH_FLAG_OUTPUT | AMVENC_FLUSH_FLAG_CBR;
-	a[8] = 2000;	/* ms */
+	/* GXL port: 1000 ms, not the vendor's 2000. A healthy frame
+	 * takes ~20 ms at 1080p; 1 s is 50x margin, and a stuck frame
+	 * stalls a live stream for half as long before the recovery
+	 * path (light reset, then instance recreate in the V4L2
+	 * wrapper) drops it and moves on.
+	 */
+	a[8] = 1000;	/* ms */
 	a[13] = w;
 	a[14] = h;
 	/* GXL port: the in-kernel meson-vdec re-runs vdec_1_start mid-stream
 	 * (source-change renegotiation) and its full write to DOS_GCLK_EN0
 	 * clears the HCodec clock gates [26:12], which hangs the next encode
-	 * (2 s timeout, -EIO). Re-assert the gates before every frame so a
+	 * (1 s timeout, -EIO). Re-assert the gates before every frame so a
 	 * running decoder can never kill the encoder. Idempotent, one RMW.
 	 */
 	WRITE_VREG_BITS(DOS_GCLK_EN0, 0x7fff, 12, 15);

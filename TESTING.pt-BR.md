@@ -107,6 +107,92 @@ Um fix no nível do driver (ordem da configuração da IRQ, ou
 reset-on-EIO em `avc_k_frame`) é depuração real de driver e não foi
 feito.
 
+## Depuração do travamento (12 nov 2026, ~18:00–18:40)
+
+O que o log verboso do driver (`encode_print_level=2`) mostrou na
+falha:
+
+```
+avc encode light reset ---
+frame type: IDR, size: 1920x1080
+mb info: 0x802a0769, encode status: 0x5, dct status: 0x0
+vlc status: 0x7, me status: 0x0, risc pc:0x911, debug:0x0
+```
+
+`encode status 0x5` é `ENCODER_MB_HEADER`: o firmware começa o
+primeiro IDR, entra na fase de cabeçalho de macrobloco e trava ali
+(RISC parado no PC 0x911, VLC no estado 7). O frame que falha é o
+próprio IDR, não um P-frame após um reset.
+
+Descartados como gatilho:
+
+- **Endereços dos buffers**: o bloco CMA de 20 MB do codificador é
+  sempre o mesmo endereço físico (0x27900000), e o buffer de entrada
+  V4L2 do ffmpeg também é sempre o mesmo (0x24500000) — nas execuções
+  boas e nas ruins. Os endereços não determinam o resultado.
+- **Conteúdo dos buffers**: uma execução falha não envenena o próximo
+  processo (uma execução boa rotineiramente segue uma ruim com os
+  mesmos buffers).
+- **Temperatura / memória / CMA**: 54 °C, sem throttling, 512 MB
+  livres, sem OOM, CMA sem fragmentação (ver acima).
+
+O que NÃO recupera uma instância travada (tudo medido):
+
+- O **light reset** do fornecedor (`amvenc_avc_light_reset`:
+  poweroff + recarga do firmware + nova requisição da IRQ, a cada
+  timeout): 50 resets seguidos nunca recuperaram uma execução falha.
+- **Recriar a instância do codificador no driver** (destruir o wq
+  após 2 erros consecutivos, reabrir do zero): 0 sucessos em 31
+  recriações. O SPS/PPS da instância recriada funciona, mas seu
+  primeiro IDR trava de novo. Só um processo ffmpeg *novo* ganha uma
+  nova moeda.
+
+O travamento é uma corrida de inicialização dentro do blob fechado do
+firmware; seu gatilho interno exato não é diagnosticável a partir do
+fonte do driver.
+
+Mudanças feitas no driver mesmo assim (nesta árvore, no ar na box de
+teste):
+
+- Timeout por frame de 2000 ms → **1000 ms** (`a[8]` em
+  `avc_k_frame`): um frame saudável leva ~20 ms, então 1 s é 50x de
+  margem e um frame travado atrasa a live pela metade do tempo.
+- Em erro de `avc_k_frame`, o wrapper V4L2 força o próximo frame a
+  ser um IDR (`force_idr`: o estado de referência se foi após o light
+  reset) e, após 2 erros consecutivos, recria a instância. Os buffers
+  falhos são completados com `VB2_BUF_STATE_ERROR`, então o trabalho
+  M2M continua rodando e o ffmpeg vê frames descartados em vez de um
+  travamento. (A recriação não corrige o travamento — ver acima — mas
+  o comportamento de descartar-e-continuar é o que permite o watchdog
+  funcionar.)
+- Uma linha `dev_dbg` em `venc_work` registra os endereços DMA de
+  entrada de cada frame (ative com dynamic debug: `echo 'file
+  venc_v4l2.c +p' > /sys/kernel/debug/dynamic_debug/control`).
+
+## Watchdog da live — PROVADO (12 nov 2026, ~18:34–18:37)
+
+`scripts/live-watchdog.sh` + `scripts/live-pipe.sh`: o pipeline da
+live HLS (decodificação HW → overlay → pipe → codificação HW 1080p,
+GOP 120) sob um watchdog que reinicia o pipeline quando o arquivo
+`-progress` do codificador não mostra frame novo por 6 s. Teste de
+150 s, fonte HLS de 3 min, saída para FLV local:
+
+- Tentativa 1: travou na partida (frame parado em 0) — detectado em
+  6 s, reiniciado.
+- Tentativa 2: rodou limpo pelos 140 s restantes: **4.053 frames a
+  29,36 fps** (conteúdo de cor sólida; testsrc2 detalhado roda
+  22–25 fps).
+- Temperatura da box após o teste: 60 °C, CPU ainda a 1,2 GHz cheios
+  (sem throttling). O processo de decodificação+overlay roda quente
+  (~285% de CPU — a cópia de CPU + overlay é o gargalo, não os
+  codecs).
+
+Para uma live de verdade, configure `LIVE_OUTPUT` com a URL RTMP (ex.
+`rtmp://a.rtmp.youtube.com/live2/KEY`) e `INPUT_URL` com a fonte da
+câmera / HLS. Um travamento então custa ~10 s de stream (6 s de
+detecção + reinício); o YouTube trata uma reconexão rápida com a
+mesma chave como o mesmo evento ao vivo.
+
 Software (libx264, CRF 23 padrão) para comparação:
 
 | Preset | 1080p fps | 1080p tamanho | 720p fps |

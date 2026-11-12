@@ -98,6 +98,84 @@ fresh coin flip; 2–3 retries give >99% success). A driver-level fix
 (IRQ setup ordering, or reset-on-EIO in `avc_k_frame`) is real driver
 debugging and is not done.
 
+## Debugging the wedge (12 Nov 2026, ~18:00–18:40)
+
+What the verbose driver log (`encode_print_level=2`) showed on failure:
+
+```
+avc encode light reset ---
+frame type: IDR, size: 1920x1080
+mb info: 0x802a0769, encode status: 0x5, dct status: 0x0
+vlc status: 0x7, me status: 0x0, risc pc:0x911, debug:0x0
+```
+
+`encode status 0x5` is `ENCODER_MB_HEADER`: the firmware starts the
+first IDR, gets into the macroblock-header phase, and wedges there
+(RISC stuck at PC 0x911, VLC in state 7). The failing frame is the
+IDR itself, not a P-frame after a reset.
+
+Ruled out as the trigger:
+
+- **Buffer addresses**: the encoder's 20 MB CMA block is always the
+  same physical address (0x27900000), and ffmpeg's V4L2 input buffer
+  is always the same address too (0x24500000) — in good runs and bad
+  runs alike. The addresses do not determine the outcome.
+- **Buffer contents**: a failed run does not poison the next process
+  (a good run routinely follows a bad one with the same buffers).
+- **Temperature / memory / CMA**: 54 °C, no throttling, 512 MB free,
+  no OOM, CMA unfragmented (see above).
+
+What does NOT recover a wedged instance (all measured):
+
+- The vendor's **light reset** (`amvenc_avc_light_reset`: poweroff +
+  firmware reload + IRQ re-request, on every timeout): 50 resets in a
+  row never recovered a failed run.
+- **Recreating the encoder instance in the driver** (destroy the wq
+  after 2 consecutive errors, re-open fresh): 0 successes in 31
+  recreates. The recreated instance's SPS/PPS succeeds but its first
+  IDR wedges again. Only a fresh ffmpeg *process* gets a new coin flip.
+
+The wedge is a startup race inside the closed firmware blob; its exact
+internal trigger is not diagnosable from the driver source.
+
+Driver changes made anyway (in this tree, live on the test box):
+
+- Per-frame timeout 2000 ms → **1000 ms** (`a[8]` in `avc_k_frame`):
+  a healthy frame takes ~20 ms, so 1 s is 50x margin and a stuck frame
+  stalls a live half as long.
+- On `avc_k_frame` error the V4L2 wrapper forces the next frame to be
+  an IDR (`force_idr`: the reference state is gone after the light
+  reset) and, after 2 consecutive errors, recreates the instance.
+  The failed buffers are completed with `VB2_BUF_STATE_ERROR`, so the
+  M2M job keeps running and ffmpeg sees dropped frames instead of a
+  hang. (The recreate does not fix the wedge — see above — but the
+  drop-and-continue behavior is what lets the watchdog work.)
+- A `dev_dbg` line in `venc_work` logs each frame's input DMA
+  addresses (enable with dynamic debug: `echo 'file venc_v4l2.c +p' >
+  /sys/kernel/debug/dynamic_debug/control`).
+
+## Live watchdog — PROVEN (12 Nov 2026, ~18:34–18:37)
+
+`scripts/live-watchdog.sh` + `scripts/live-pipe.sh`: the HLS live
+pipeline (HW decode → overlay → pipe → HW encode 1080p, GOP 120)
+under a watchdog that restarts the pipeline when the encoder's
+`-progress` file shows no new frame for 6 s. 150 s test, 3 min HLS
+source, output to local FLV:
+
+- Attempt 1: wedged at startup (frame stuck at 0) — detected in 6 s,
+  restarted.
+- Attempt 2: ran clean for the remaining 140 s: **4,053 frames at
+  29.36 fps** (solid-colour content; detailed testsrc2 runs 22–25 fps).
+- Box temperature after the test: 60 °C, CPU still at full 1.2 GHz
+  (no throttling). The decode+overlay process runs hot (~285% CPU —
+  the CPU copy + overlay is the bottleneck, not the codecs).
+
+For a real live, set `LIVE_OUTPUT` to the RTMP URL (e.g.
+`rtmp://a.rtmp.youtube.com/live2/KEY`) and `INPUT_URL` to the camera /
+HLS source. A wedge then costs ~10 s of stream (6 s detection +
+restart); YouTube treats a quick reconnect with the same stream key
+as the same live event.
+
 Software (libx264, CRF 23 default) for comparison:
 
 | Preset | 1080p fps | 1080p size | 720p fps |
