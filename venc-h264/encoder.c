@@ -101,6 +101,19 @@ static u32 clock_level = 6;
 
 static u32 encode_print_level = LOG_ERROR;
 static u32 no_timeout;
+/* GXL experiment (13 Nov 2026): power-off delay in the light reset.
+ * Hypothesis: the vendor's 30 ms never unwedged a stuck HCodec (0/50
+ * recoveries) because the power rail never discharges below the
+ * SRAM/VLC state-retention threshold in 30 ms. TESTED 13 Nov 2026
+ * (20 runs x 30 frames at 200 ms): REFUTED — 0 light-reset
+ * recoveries at 200 ms, same ~10% full-wedge rate as the 30 ms
+ * baseline (2/20 runs fully wedged, 2/20 recovered only via the
+ * V4L2 instance recreate). The wedge state persists across the
+ * power cycle for a different reason (VLC state machine and/or
+ * DMEM not actually cleared). Default stays at the vendor's 30 ms;
+ * the parameter remains for future experiments.
+ */
+static u32 reset_delay_ms = 30;
 static int nr_mode = -1;
 static u32 qp_table_debug;
 static u32 use_reset_control;
@@ -4296,7 +4309,14 @@ Again:
 				READ_HREG(HCODEC_ME_STATUS),
 				READ_HREG(HCODEC_MPC_E),
 				READ_HREG(DEBUG_REG));
-			amvenc_avc_light_reset(wq, 30);
+			/* GXL: power-off delay in the light reset, tunable
+			 * via the reset_delay_ms module parameter (default
+			 * 30 ms, the vendor value). A 200 ms delay was
+			 * tested 13 Nov 2026 (20 runs) and did NOT improve
+			 * recovery (0 light-reset recoveries), so the
+			 * default stays at 30 ms.
+			 */
+			amvenc_avc_light_reset(wq, reset_delay_ms);
 		}
 
 		for (i = 0; i < request->plane_num; i++) {
@@ -5307,6 +5327,9 @@ MODULE_PARM_DESC(encode_print_level, "\n encode_print_level\n");
 
 module_param(no_timeout, uint, 0664);
 MODULE_PARM_DESC(no_timeout, "\n no_timeout flag for process request\n");
+
+module_param(reset_delay_ms, uint, 0664);
+MODULE_PARM_DESC(reset_delay_ms, "\n power-off delay (ms) in the light reset\n");
 
 module_param(nr_mode, int, 0664);
 MODULE_PARM_DESC(nr_mode, "\n nr_mode option\n");

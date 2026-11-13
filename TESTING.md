@@ -132,11 +132,14 @@ What does NOT recover a wedged instance (all measured):
   row never recovered a failed run.
 - **Recreating the encoder instance in the driver** (destroy the wq
   after 2 consecutive errors, re-open fresh): 0 successes in 31
-  recreates. The recreated instance's SPS/PPS succeeds but its first
-  IDR wedges again. Only a fresh ffmpeg *process* gets a new coin flip.
+  recreates in the first battery (12 Nov). A later battery (13 Nov,
+  20 runs) saw 2 recoveries via recreate out of 4 wedged runs — so
+  the recreate is itself a coin flip, not a reliable fix. Only a
+  fresh ffmpeg *process* reliably gets a new coin flip.
 
-The wedge is a startup race inside the closed firmware blob; its exact
-internal trigger is not diagnosable from the driver source.
+The wedge is a startup race inside the closed firmware blob. Its
+exact internal trigger is now partially understood — see
+"Firmware reverse engineering (AMRISC / Project Vicigol)" below.
 
 Driver changes made anyway (in this tree, live on the test box):
 
@@ -153,6 +156,73 @@ Driver changes made anyway (in this tree, live on the test box):
 - A `dev_dbg` line in `venc_work` logs each frame's input DMA
   addresses (enable with dynamic debug: `echo 'file venc_v4l2.c +p' >
   /sys/kernel/debug/dynamic_debug/control`).
+- A `dev_info` line logs `recovered after N consecutive errors`
+  when a frame succeeds after errors (recovery signal for the
+  experiments below).
+- Module parameter `reset_delay_ms` (default 30, the vendor value):
+  power-off delay in the light reset, tunable at runtime via
+  `/sys/module/amvenc_avc/parameters/reset_delay_ms`.
+
+## Firmware reverse engineering (AMRISC / Project Vicigol)
+
+The firmware blob is code for Amlogic's custom RISC core, **AMRISC**:
+32-bit, 64 general-purpose registers, one branch delay slot,
+**28-bit instructions stored in 32-bit words** (4 bits of padding).
+It was documented by [Project Vicigol](https://codeberg.org/neuschaefer/vicigol)
+(J. Neuschäfer, GPN23 2025), which ships an architecture manual, an
+emulator, and a disassembler (`vici-dasm`). The full disassembly of
+`gxl_h264_enc.bin` is 6,438 lines of coherent code (calls, branches,
+loops, named control registers such as `MCPU_INTR_MSK` and
+`LMEM_DMA_*`). The blob is 24 KiB; only the first ~10.4 KiB contain
+code (up to address 0x0a23), the rest is zeros.
+
+Findings relevant to the wedge:
+
+- The driver's "risc pc" dump reads `HCODEC_MPC_E` — the M-core's
+  execute-stage program counter (word-based). The wedge PC **0x911**
+  is a `sub r0, r1, r0` inside a rate-control decision function
+  (called from the main loop at 0x0a08, entered via `blti r0, 0`
+  when its input is negative). A `sub` cannot hang by itself: the
+  core is stalled there, not looping.
+- Main loop (0x0a05): if flag DMEM[0x36] is set, call the
+  rate-control function with r0 = DMEM[0x28]; then dispatch the
+  mailbox command (register 0x0ac0): 1/2 = ACK, 3/4 = frame setup
+  (0x08c9) + arm flag 0x36.
+- Frame setup (0x08c9) clears DMEM[0x24/0x26/0x27/0x28] to zero on
+  every frame. An interrupt handler (0x03e4, vector 0x0022)
+  computes DMEM[0x27] = clamped bitrate error (actual bits minus
+  target, ±32767) and decrements DMEM[0x28].
+- The wedge path (0x911) is taken **iff DMEM[0x28] == 0 AND
+  DMEM[0x27] < 0**. Strong hypothesis (fits all observations): the
+  path is armed in the first frames (0x28 is zero until the
+  rate-control function fills it), triggered when the bitrate error
+  goes negative (few bits produced early in the stream), and the
+  race is the interrupt handler's DMEM write vs. the main loop's
+  rate-control call — timing varies per run, hence the ~20–40%
+  failure rate. The stall at the `sub` is likely a pipeline hazard
+  on r0, just loaded by the `ldas` in the delay slot.
+- The firmware loader (`amvenc_loadmc`) loads only the first 16 KiB
+  into IMEM via DMA and **does not touch DMEM** — so DMEM state
+  survives a firmware reload.
+
+## Longer power-off delay experiment — REFUTED (13 Nov 2026)
+
+Hypothesis: the vendor's 30 ms power-off in the light reset is too
+short for the HCodec power rail to discharge below the SRAM/VLC
+state-retention threshold, so the wedged state survives the reset.
+Test: `reset_delay_ms=200` (6.7x longer), 20 runs x 30 frames:
+
+- 17/20 runs clean (30/30 frames).
+- 2/20 runs fully wedged (0 frames, 30 errors each) — no recovery.
+- 2/20 runs failed 2 and 4 frames, then recovered via the V4L2
+  instance recreate (not via the light reset).
+- **Light-reset recoveries: 0.** The 200 ms delay produced no
+  improvement over the 30 ms baseline (2/10 fully wedged there).
+
+Conclusion: power-rail discharge time is not the mechanism. The
+default stays at the vendor's 30 ms; `reset_delay_ms` remains as a
+tunable parameter for future experiments. The watchdog (restart the
+ffmpeg process) remains the only reliable recovery.
 
 ## Live watchdog — PROVEN (12 Nov 2026, ~18:34–18:37)
 
@@ -265,12 +335,17 @@ ffmpeg 7.1.5 (Debian) has no `v4l2m2m` hwaccel
 (`Unrecognized hwaccel: v4l2m2m`), so the `-hwaccel v4l2m2m` path is
 unavailable; only the explicit `-c:v h264_v4l2m2m` decoder exists.
 
-### Unexplained reboots (4x on 12 Nov 2026)
+### Unexplained reboots (5x: 4x on 12 Nov, 1x on 13 Nov 2026)
 
 - ~12:20: hard reboot during the very first encode test (venc CLI).
 - ~15:38: reboot during a HW-decode+HW-encode test run.
 - ~16:35: reboot during the NV12M regression test.
 - ~16:47: reboot during an encoder-only test (HW encode of a 30 s file).
+- ~03:15 on 13 Nov: reboot during run 1 of the 200 ms battery
+  (first encode with the new driver build). No crash log despite
+  persistent journald — the journal ends with USB noise only.
+  Whether the new build contributed is unknown; the box then ran
+  the full 20-run battery plus further encodes without rebooting.
 - No crash logs survived any of them (Armbian ramlog only syncs
   periodically; `kernel.panic = 0`, so a panic would hang, not reboot —
   the reboots are consistent with the hardware watchdog (`/dev/watchdog`

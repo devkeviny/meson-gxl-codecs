@@ -262,6 +262,14 @@ static void venc_work(struct work_struct *work)
 		}
 		goto done;
 	}
+	/* GXL experiment (13 Nov 2026): recovery signal. A frame that
+	 * succeeds after consecutive errors means the light reset (with
+	 * the longer power-off delay) actually unwedged the HCodec.
+	 */
+	if (ctx->err_count)
+		dev_info(ctx->vdev->dev,
+			 "recovered after %u consecutive errors\n",
+			 ctx->err_count);
 	ctx->err_count = 0;
 
 	size = (idr ? ctx->hdr_len : 0) + len;

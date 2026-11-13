@@ -143,13 +143,16 @@ O que NÃO recupera uma instância travada (tudo medido):
   timeout): 50 resets seguidos nunca recuperaram uma execução falha.
 - **Recriar a instância do codificador no driver** (destruir o wq
   após 2 erros consecutivos, reabrir do zero): 0 sucessos em 31
-  recriações. O SPS/PPS da instância recriada funciona, mas seu
-  primeiro IDR trava de novo. Só um processo ffmpeg *novo* ganha uma
-  nova moeda.
+  recriações na primeira bateria (12 nov). Uma bateria posterior
+  (13 nov, 20 runs) viu 2 recuperações via recriação em 4 runs
+  travadas — ou seja, a recriação também é uma moeda, não um fix
+  confiável. Só um processo ffmpeg *novo* ganha uma nova moeda de
+  forma confiável.
 
 O travamento é uma corrida de inicialização dentro do blob fechado do
-firmware; seu gatilho interno exato não é diagnosticável a partir do
-fonte do driver.
+firmware. Seu gatilho interno exato agora é parcialmente entendido —
+ver "Engenharia reversa do firmware (AMRISC / Project Vicigol)"
+abaixo.
 
 Mudanças feitas no driver mesmo assim (nesta árvore, no ar na box de
 teste):
@@ -168,6 +171,77 @@ teste):
 - Uma linha `dev_dbg` em `venc_work` registra os endereços DMA de
   entrada de cada frame (ative com dynamic debug: `echo 'file
   venc_v4l2.c +p' > /sys/kernel/debug/dynamic_debug/control`).
+- Uma linha `dev_info` registra `recovered after N consecutive
+  errors` quando um frame funciona após erros (sinal de recuperação
+  para os experimentos abaixo).
+- Parâmetro de módulo `reset_delay_ms` (padrão 30, o valor do
+  fornecedor): delay de power-off no light reset, ajustável em
+  tempo real via `/sys/module/amvenc_avc/parameters/reset_delay_ms`.
+
+## Engenharia reversa do firmware (AMRISC / Project Vicigol)
+
+O blob do firmware é código para o núcleo RISC proprietário da
+Amlogic, **AMRISC**: 32 bits, 64 registradores de uso geral, um
+branch delay slot, **instruções de 28 bits guardadas em palavras de
+32 bits** (4 bits de padding). Foi documentado pelo
+[Project Vicigol](https://codeberg.org/neuschaefer/vicigol)
+(J. Neuschäfer, GPN23 2025), que publica um manual da arquitetura, um
+emulador e um desmontador (`vici-dasm`). O disassembly completo do
+`gxl_h264_enc.bin` tem 6.438 linhas de código coerente (chamadas,
+branches, loops, registradores com nome como `MCPU_INTR_MSK` e
+`LMEM_DMA_*`). O blob tem 24 KiB; só os primeiros ~10,4 KiB contêm
+código (até o endereço 0x0a23), o resto é zero.
+
+Achados relevantes para o travamento:
+
+- O "risc pc" do dump do driver lê `HCODEC_MPC_E` — o program
+  counter do estágio de execução do M-core (baseado em palavras). O
+  PC do travamento **0x911** é um `sub r0, r1, r0` dentro de uma
+  função de decisão de controle de taxa (chamada do loop principal
+  em 0x0a08, entrada por `blti r0, 0` quando a entrada é negativa).
+  Um `sub` não trava sozinho: o núcleo está parado ali, não em loop.
+- Loop principal (0x0a05): se a flag DMEM[0x36] estiver armada,
+  chama a função de controle de taxa com r0 = DMEM[0x28]; depois
+  despacha o comando do mailbox (registrador 0x0ac0): 1/2 = ACK,
+  3/4 = setup do frame (0x08c9) + arma a flag 0x36.
+- O setup do frame (0x08c9) zera DMEM[0x24/0x26/0x27/0x28] a cada
+  frame. Um handler de interrupção (0x03e4, vetor 0x0022) calcula
+  DMEM[0x27] = erro de bitrate com clamp (bits reais menos meta,
+  ±32767) e decrementa DMEM[0x28].
+- O caminho do travamento (0x911) é tomado **sse DMEM[0x28] == 0 E
+  DMEM[0x27] < 0**. Hipótese forte (encaixa em todas as
+  observações): o caminho é armado nos primeiros frames (0x28 é
+  zero até a função de controle de taxa preenchê-lo), disparado
+  quando o erro de bitrate fica negativo (poucos bits produzidos no
+  início do stream), e a corrida é a escrita de DMEM do handler de
+  interrupção contra a chamada de controle de taxa do loop
+  principal — o timing varia por execução, daí a taxa de falha de
+  ~20–40%. O stall no `sub` é provavelmente um hazard de pipeline
+  no r0, recém-carregado pelo `ldas` no delay slot.
+- O carregador do firmware (`amvenc_loadmc`) carrega só os
+  primeiros 16 KiB para a IMEM via DMA e **não toca a DMEM** — ou
+  seja, o estado da DMEM sobrevive à recarga do firmware.
+
+## Experimento do delay de power-off maior — REFUTADO (13 nov 2026)
+
+Hipótese: os 30 ms de power-off do fornecedor no light reset são
+curtos demais para o trilho de energia do HCodec descarregar abaixo
+do limiar de retenção de estado da SRAM/VLC, então o estado travado
+sobrevive ao reset. Teste: `reset_delay_ms=200` (6,7x maior),
+20 runs x 30 frames:
+
+- 17/20 runs limpos (30/30 frames).
+- 2/20 runs totalmente travados (0 frames, 30 erros cada) — sem
+  recuperação.
+- 2/20 runs falharam 2 e 4 frames, depois se recuperaram via
+  recriação da instância V4L2 (não via light reset).
+- **Recuperações por light reset: 0.** Os 200 ms não trouxeram
+  melhora sobre o baseline de 30 ms (2/10 totalmente travados lá).
+
+Conclusão: o tempo de descarga do trilho não é o mecanismo. O padrão
+continua nos 30 ms do fornecedor; `reset_delay_ms` fica como
+parâmetro ajustável para experimentos futuros. O watchdog (reiniciar
+o processo ffmpeg) continua sendo a única recuperação confiável.
 
 ## Watchdog da live — PROVADO (12 nov 2026, ~18:34–18:37)
 
@@ -284,13 +358,18 @@ O ffmpeg 7.1.5 (Debian) não tem hwaccel `v4l2m2m`
 (`Unrecognized hwaccel: v4l2m2m`), então o caminho `-hwaccel v4l2m2m`
 não existe; só o decoder explícito `-c:v h264_v4l2m2m`.
 
-### Reboots sem explicação (4x em 12 nov 2026)
+### Reboots sem explicação (5x: 4x em 12 nov, 1x em 13 nov 2026)
 
 - ~12:20: reboot durante o primeiríssimo teste de encode (CLI venc).
 - ~15:38: reboot durante um teste de decode HW + encode HW.
 - ~16:35: reboot durante o teste de regressão do NV12M.
 - ~16:47: reboot durante um teste só de encode (encode HW de um
   arquivo de 30 s).
+- ~03:15 em 13 nov: reboot durante a run 1 da bateria de 200 ms
+  (primeiro encode com o novo build do driver). Nenhum log de crash
+  apesar do journald persistente — o journal termina só com ruído
+  de USB. Se o novo build contribuiu, não se sabe; a box depois
+  rodou a bateria completa de 20 runs e mais encodes sem rebootar.
 - Nenhum log de crash sobreviveu a nenhum deles (o ramlog do Armbian
   só sincroniza periodicamente; `kernel.panic = 0`, então um panic
   travaria, não rebootaria — os reboots são compatíveis com o watchdog
